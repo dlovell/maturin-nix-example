@@ -14,94 +14,98 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
+  outputs = { self, nixpkgs, flake-utils, crane, rust-overlay, ... }:
+    flake-utils.lib.eachDefaultSystem (system:
+    let
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default ];
+      };
 
-  outputs = inputs:
-    inputs.flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import inputs.nixpkgs {
-          inherit system;
-          overlays = [ inputs.rust-overlay.overlays.default ];
-        };
-        lib = pkgs.lib;
+      pythonVersion = "310";
+      rustVersion = "1.70.0";
+      cargoToml = ./Cargo.toml;
+      src = ./.;
 
-        # Get a custom rust toolchain
-        customRustToolchain = pkgs.rust-bin.stable."1.70.0".default;
-        craneLib =
-          (inputs.crane.mkLib pkgs).overrideToolchain customRustToolchain;
+      python = pkgs.${"python" + pythonVersion};
+      wheelTail = "cp${pythonVersion}-cp${pythonVersion}-manylinux_2_34_x86_64";
+      wheelName = "${commonArgs.pname}-${commonArgs.version}-${wheelTail}.whl";
+      craneLib = (crane.mkLib pkgs).overrideToolchain pkgs.rust-bin.stable.${rustVersion}.default;
 
-        projectName =
-          (craneLib.crateNameFromCargoToml { cargoToml = ./Cargo.toml; }).pname;
-        projectVersion = (craneLib.crateNameFromCargoToml {
-          cargoToml = ./Cargo.toml;
-        }).version;
-
-        pythonVersion = pkgs.python310;
-        wheelTail =
-          "cp310-cp310-manylinux_2_34_x86_64"; # Change if pythonVersion changes
-        wheelName = "${projectName}-${projectVersion}-${wheelTail}.whl";
-
-        crateCfg = {
-          src = craneLib.cleanCargoSource (craneLib.path ./.);
-          nativeBuildInputs = [ pythonVersion ];
-        };
-
-        # Build the library, then re-use the target dir to generate the wheel file with maturin
-        crateWheel = (craneLib.buildPackage (crateCfg // {
-          pname = projectName;
-          version = projectVersion;
-          # cargoArtifacts = crateArtifacts;
-        })).overrideAttrs (old: {
-          nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.maturin ];
-          buildPhase = old.buildPhase + ''
-            maturin build --offline --target-dir ./target
-          '';
-          installPhase = old.installPhase + ''
-            cp target/wheels/${wheelName} $out/
-          '';
-        });
-      in rec {
-        packages = rec {
-          default = crateWheel; # The wheel itself
-
-          # A python version with the library installed
-          pythonEnv = pythonVersion.withPackages
-            (ps: [ (lib.pythonPackage ps) ] ++ (with ps; [ ipython ]));
-        };
-
-        lib = {
-          # To use in other builds with the "withPackages" call
-          pythonPackage = ps:
-            ps.buildPythonPackage rec {
-              pname = projectName;
-              format = "wheel";
-              version = projectVersion;
-              src = "${crateWheel}/${wheelName}";
-              doCheck = false;
-              pythonImportsCheck = [ projectName ];
-            };
-        };
-
-        devShells = rec {
-          rust = pkgs.mkShell {
-            name = "rust-env";
-            src = ./.;
-            nativeBuildInputs = with pkgs; [ pkg-config rust-analyzer maturin ];
-          };
-          python = let
-          in pkgs.mkShell {
-            name = "python-env";
-            src = ./.;
-            nativeBuildInputs = [ packages.pythonEnv ];
-          };
-          default = rust;
-        };
-
-        apps = rec {
-          ipython = {
-            type = "app";
-            program = "${packages.pythonEnv}/bin/ipython";
-          };
-          default = ipython;
-        };
+      commonArgs = {
+        pname = (builtins.fromTOML (builtins.readFile cargoToml)).lib.name;
+        inherit (craneLib.crateNameFromCargoToml { inherit cargoToml; }) version;
+      };
+      crateWheel = (craneLib.buildPackage (commonArgs // {
+        src = craneLib.cleanCargoSource (craneLib.path src);
+        nativeBuildInputs = [ python ];
+      })).overrideAttrs (old: {
+        nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.maturin ];
+        buildPhase = old.buildPhase + ''
+          maturin build --offline --target-dir target
+        '';
+        installPhase = old.installPhase + ''
+          cp target/wheels/${wheelName} $out/
+        '';
       });
+      maturin-init-script = pkgs.writeShellScriptBin "maturin-init" ''
+        set -xeu
+        ${pkgs.maturin}/bin/maturin init "''${@}"
+        ${pkgs.cargo}/bin/cargo update
+      '';
+      maturin-init-pyo3-script = pkgs.writeShellScriptBin "maturin-init-pyo3" ''
+        set -xeu
+        ${pkgs.maturin}/bin/maturin init --bindings pyo3 "''${@}"
+        ${pkgs.cargo}/bin/cargo update
+      '';
+    in rec {
+      packages = {
+        default = crateWheel;
+        pythonEnv = python.withPackages (ps: [
+          (lib.pythonPackage ps)
+          ps.ipython
+        ]);
+      };
+      lib = {
+        pythonPackage = ps:
+          ps.buildPythonPackage (commonArgs // rec {
+            format = "wheel";
+            src = "${crateWheel}/${wheelName}";
+            doCheck = false;
+            pythonImportsCheck = [ commonArgs.pname ];
+          });
+        };
+      devShells = rec {
+        rust = pkgs.mkShell {
+          name = "rust-env";
+          inherit src;
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            rust-analyzer
+            maturin
+            maturin-init-script
+            maturin-init-pyo3-script
+          ];
+        };
+        python = pkgs.mkShell {
+          name = "python-env";
+          inherit src;
+          nativeBuildInputs = [ packages.pythonEnv ];
+        };
+        default = python;
+      };
+      apps = rec {
+        ipython = flake-utils.lib.mkApp {
+          drv = packages.pythonEnv;
+          name = "ipython";
+        };
+        maturin-init = flake-utils.lib.mkApp {
+          drv = maturin-init-script;
+        };
+        maturin-init-pyo3 = flake-utils.lib.mkApp {
+          drv = maturin-init-pyo3-script;
+        };
+        default = ipython;
+      };
+    });
 }
