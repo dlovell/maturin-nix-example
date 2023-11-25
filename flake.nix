@@ -107,7 +107,11 @@
         };
         default = ipython;
       };
-      templates.default = ./flake.nix;
-      defaultTemplate = self.templates.default;
+      templates = {
+        default = {
+          path = ./flake.nix;
+          description = "pyo3 template via crane";
+        };
+      };
     });
 }
