@@ -109,7 +109,7 @@
       };
       templates = {
         default = {
-          path = ./flake.nix;
+          path = self;
           description = "pyo3 template via crane";
         };
       };
