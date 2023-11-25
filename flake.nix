@@ -107,5 +107,7 @@
         };
         default = ipython;
       };
+      templates.default = ./flake.nix;
+      defaultTemplate = self.templates.default;
     });
 }
